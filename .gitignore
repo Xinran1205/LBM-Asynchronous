@@ -1,0 +1,43 @@
+*.o
+
+d2q9-bgk
+d2q9-bgk.out
+final_state.dat
+av_vels.dat
+final_state.png
+
+# Prerequisites
+*.d
+**/cmake-build-debug/
+**/.idea/
+**/out/
+**/.vscode/
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
