@@ -97,8 +97,15 @@ int initialise(const char* paramfile, const char* obstaclefile,
 */
 int timestep(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obstacles);
 int write_values(const t_param params, t_speed* cells, int* obstacles, float* av_vels);
-float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells, const int* obstacles, float w11, float w22,
-                  float c_sq, float w0, float w1, float w2, float divideVal, float divideVal2, int ThisRank,int ProcessSize);
+//float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells, const int* obstacles, float w11, float w22,
+//                  float c_sq, float w0, float w1, float w2, float divideVal, float divideVal2, int ThisRank,int ProcessSize);
+
+float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells,
+                  const int* obstacles, float w11, float w22,
+                  float c_sq, float w0, float w1, float w2,
+                  float divideVal, float divideVal2,
+                  int ThisRank, int ProcessSize,
+                  int rowStart, int rowEnd,int do_accel);
 
 /* finalise, including freeing up allocated memory */
 int finalise(const t_param* params, t_speed** cells_ptr, t_speed** tmp_cells_ptr,
@@ -117,6 +124,7 @@ float calc_reynolds(const t_param params, t_speed* cells, int* obstacles);
 /* utility functions */
 void die(const char* message, const int line, const char* file);
 void usage(const char* exe);
+
 
 void write_animation_data_mpi(const t_param params, t_speed* cells, const int timestep,
                               const int* obstacles, int ThisRank, int ProcessSize,
@@ -204,33 +212,48 @@ int main(int argc, char* argv[])
 
     for(int tt = 0; tt < params.maxIters; tt++)
     {
-        // 上下是连着的，但是左右不是连着的
-        // each iteration, we need to do halo exchange to update the boundary values for each process
-        // Halo exchange
         int up_neighbor = (ThisRank - 1 + ProcessSize) % ProcessSize;
         int down_neighbor = (ThisRank + 1) % ProcessSize;
 
-        // param.nx 是有多少列, param.ny现在的值是每个进程cells的整个行数，包括halo
-        // 真正数据存储在cells[param.nx]到cells[param.nx+（param.ny-2）*param.nx]之间
-        // 中，前param.nx个元素用来存储上边界，后param.nx个元素用来存储下边界
+        // *** MOD ➋: 非阻塞通信 + 计算重叠
+        // req是返回的句柄，用于后续查询或等待这条非阻塞操作完成。
+        MPI_Request req[4];
 
-        // send to up neighbor and receive from down neighbor
+        // 10和11是tag 整型标签，用来区分不同消息。必须在收发两端匹配。
+        // (A) post non‑blocking halo exchange
+        // MPI_Isend第一个参数是发送缓冲区的起始地址（跳过第一行halo行）
+        MPI_Isend(cells+params.nx,              params.nx, MPI_T_SPEED, up_neighbor,   11, MPI_COMM_WORLD, &req[2]);             // 发送第一真实行
+        MPI_Isend(cells+(params.ny-2)*params.nx,params.nx, MPI_T_SPEED, down_neighbor, 10, MPI_COMM_WORLD, &req[3]);             // 发送最后真实行
 
-        // 这里发送的部分有问题,解决了，是因为传输的结构定义错误！应该要自定义
+        // MPI_Irecv第一个参数是接收缓冲区的起始地址
+        MPI_Irecv(cells,                        params.nx, MPI_T_SPEED, up_neighbor,   10, MPI_COMM_WORLD, &req[0]);             // 上 halo
+        MPI_Irecv(cells+(params.ny-1)*params.nx,params.nx, MPI_T_SPEED, down_neighbor, 11, MPI_COMM_WORLD, &req[1]);             // 下 halo
 
-//        一次调用同时完成一个发送和一个接收，常用来做双向halo交换：指定发送缓冲区、
-//        目标rank、标签，同时指定接收缓冲区、来源rank、标签。属于阻塞发送/阻塞接收：返回时发送缓冲区已可安全重用，接收缓冲区已写满；
-//        、但不能保证对方也已完成它自己的Recv/Send。消息在同一(src,dst,tag,comm)通道内按发送顺序到达，MPI保证不丢包。
-        MPI_Sendrecv(cells+params.nx, params.nx, MPI_T_SPEED, up_neighbor, 0,
-                     cells+(params.ny-1)*params.nx, params.nx, MPI_T_SPEED, down_neighbor, 0,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        // (B) 先算内部行 (2 .. ny‑3)，可与网路传输并行
+        // 这个do_accel参数很重要，防止重复加速，对于最后一个进程，只需要在这里加速一次即可，在后续依赖halo的部分不需要加速
+        float tot_u_in  = fusion_more(params, cells, tmp_cells, obstacles,
+                                      w11, w22, c_sq, w0, w1, w2,
+                                      divideVal, divideVal2,
+                                      ThisRank, ProcessSize,
+                /*rowStart*/2, /*rowEnd*/params.ny-3, 1);
 
-        // send to down neighbor and receive from up neighbor
-        MPI_Sendrecv(cells+(params.ny-2)*params.nx, params.nx, MPI_T_SPEED, down_neighbor, 0,
-                     cells, params.nx, MPI_T_SPEED, up_neighbor, 0,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        // (C) 等待 halo 完成
+        // MPI_Waitall(4, req, MPI_STATUSES_IGNORE); 的作用就是 阻塞当前线程，
+        // 直到 req[0]‥req[3] 所代表的 4个非阻塞通信全部完成。
+        MPI_Waitall(4, req, MPI_STATUSES_IGNORE);
 
-        av_vels[tt] = fusion_more(params, cells, tmp_cells, obstacles, w11, w22, c_sq, w0, w1, w2,divideVal,divideVal2,ThisRank,ProcessSize);
+        // (D) 再算依赖 halo 的边界行 1 与 ny‑2
+        float tot_u_bd  = fusion_more(params, cells, tmp_cells, obstacles,
+                                      w11, w22, c_sq, w0, w1, w2,
+                                      divideVal, divideVal2,
+                                      ThisRank, ProcessSize, 1, 1, 0);
+        tot_u_bd +=      fusion_more(params, cells, tmp_cells, obstacles,
+                                     w11, w22, c_sq, w0, w1, w2,
+                                     divideVal, divideVal2,
+                                     ThisRank, ProcessSize, params.ny-2, params.ny-2, 0);
+
+        // (E) 汇总本轮速度并交换指针
+        av_vels[tt] = tot_u_in + tot_u_bd;
 
         // 每100个时间步输出一次动画数据
 //        if (tt % 100 == 0) {
@@ -238,13 +261,9 @@ int main(int argc, char* argv[])
 //                                     KeepTotalRows, obstacles_Total, MPI_T_SPEED);
 //        }
 
-        // swap the pointers between cells and tmp_cells
-        t_speed* temp;
-        temp = cells;
-        cells = tmp_cells;
-        tmp_cells = temp;
-
-        // after swap, cells's value from 0 to nx is not initialized, make sure you don't use them
+        t_speed* temp = cells;   // pointer swap
+        cells          = tmp_cells;
+        tmp_cells      = temp;
     }
 
     /* Compute time stops here, collate time starts*/
@@ -254,7 +273,7 @@ int main(int argc, char* argv[])
 
     // Collate data from ranks here
 
-    // 下面的结果如果和上面不一样，说明拷贝出了问题！
+    //如果下面的结果如果和上面不一样，说明拷贝出了问题！
 
     // 主进程在这回收数据, 回收的时候要注意，每个cells只有一部分是真正的数据，还有两行是halo
     // 回收cells，并且放到results中
@@ -332,14 +351,15 @@ int main(int argc, char* argv[])
 
 float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells,const int* obstacles, const float w11,const float w22,
                   const float c_sq, const float w0,const float w1,const float w2,
-                  const float divideVal,const float divideVal2, int ThisRank, int ProcessSize){
+                  const float divideVal,const float divideVal2, int ThisRank, int ProcessSize ,
+                  int rowStart, int rowEnd, int do_accel){
 
     /* modify the 2nd row of the grid */
     // accelerate flow!!!!!
     // if this is the last process
     // 这里只对最后一个进程进行加速操作
     // 如果是最后一个进程，那么对倒数第二行进行加速操作
-    if (ThisRank == ProcessSize-1 ){
+    if (do_accel==1 && ThisRank == ProcessSize-1 ){
         const int LastSecondRow = params.ny - 3;
         // LastSecondRow = 3
         for (int ii = 0; ii < params.nx; ii++)
@@ -374,7 +394,7 @@ float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells,const
     // jj index from 1 to params.ny-2
     // ii index from 0 to params.nx-1
     // 因为jj=0和最后一行是halo部分，是其他进程的halo数据，所以此进程要处理的数据从1开始到params.ny-2
-    for (int jj = 1; jj < params.ny-1; jj++)
+    for (int jj = rowStart; jj <= rowEnd; jj++)
     {
         for (int ii = 0; ii < params.nx; ii++)
         {

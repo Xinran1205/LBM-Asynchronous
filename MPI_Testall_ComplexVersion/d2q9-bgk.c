@@ -97,8 +97,24 @@ int initialise(const char* paramfile, const char* obstaclefile,
 */
 int timestep(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obstacles);
 int write_values(const t_param params, t_speed* cells, int* obstacles, float* av_vels);
-float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells, const int* obstacles, float w11, float w22,
-                  float c_sq, float w0, float w1, float w2, float divideVal, float divideVal2, int ThisRank,int ProcessSize);
+//float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells, const int* obstacles, float w11, float w22,
+//                  float c_sq, float w0, float w1, float w2, float divideVal, float divideVal2, int ThisRank,int ProcessSize);
+
+float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells,
+                  const int* obstacles, float w11, float w22,
+                  float c_sq, float w0, float w1, float w2,
+                  float divideVal, float divideVal2,
+                  int ThisRank, int ProcessSize,
+                  int rowStart, int rowEnd,int do_accel);
+
+/* 使用外部halo数据的融合计算函数 */
+float fusion_more_with_halo(const t_param params, t_speed* cells, t_speed* tmp_cells,
+                           const int* obstacles, float w11, float w22,
+                           float c_sq, float w0, float w1, float w2,
+                           float divideVal, float divideVal2,
+                           int ThisRank, int ProcessSize,
+                           int rowStart, int rowEnd, int do_accel,
+                           t_speed* halo_top, t_speed* halo_bottom);
 
 /* finalise, including freeing up allocated memory */
 int finalise(const t_param* params, t_speed** cells_ptr, t_speed** tmp_cells_ptr,
@@ -164,6 +180,11 @@ int main(int argc, char* argv[])
     int KeepTotalRows = 0;
     int* obstacles_Total = NULL;
     int numberOfNonObstacles = 0;
+    
+    /* 异步优化：保存旧halo区域的变量 */
+    t_speed* old_halo_top = NULL;     /* 保存上边界旧halo数据 */
+    t_speed* old_halo_bottom = NULL;  /* 保存下边界旧halo数据 */
+    int halo_initialized = 0;         /* 标识halo数据是否已初始化 */
 
     /* parse the command line */
     if (argc != 3)
@@ -194,6 +215,12 @@ int main(int argc, char* argv[])
     const float divideVal = 2.f * c_sq * c_sq;
     const float divideVal2 = 2.f * c_sq;
 
+    /* 异步优化：为旧halo区域分配内存 */
+    old_halo_top = (t_speed*)malloc(sizeof(t_speed) * params.nx);
+    old_halo_bottom = (t_speed*)malloc(sizeof(t_speed) * params.nx);
+    if (old_halo_top == NULL || old_halo_bottom == NULL) 
+        die("cannot allocate memory for old halo regions", __LINE__, __FILE__);
+
     /* Init time stops here, compute time starts*/
     gettimeofday(&timstr, NULL);
     init_toc = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
@@ -204,57 +231,138 @@ int main(int argc, char* argv[])
 
     for(int tt = 0; tt < params.maxIters; tt++)
     {
-        // 上下是连着的，但是左右不是连着的
-        // each iteration, we need to do halo exchange to update the boundary values for each process
-        // Halo exchange
         int up_neighbor = (ThisRank - 1 + ProcessSize) % ProcessSize;
         int down_neighbor = (ThisRank + 1) % ProcessSize;
 
-        // param.nx 是有多少列, param.ny现在的值是每个进程cells的整个行数，包括halo
-        // 真正数据存储在cells[param.nx]到cells[param.nx+（param.ny-2）*param.nx]之间
-        // 中，前param.nx个元素用来存储上边界，后param.nx个元素用来存储下边界
+        // *** MOD ➋: 非阻塞通信 + 计算重叠
+        // req是返回的句柄，用于后续查询或等待这条非阻塞操作完成。
+        MPI_Request req[4];
 
-        // send to up neighbor and receive from down neighbor
+        // 10和11是tag 整型标签，用来区分不同消息。必须在收发两端匹配。
+        // (A) post non‑blocking halo exchange
+        // MPI_Irecv第一个参数是接收缓冲区的起始地址
+        MPI_Irecv(cells,                        params.nx, MPI_T_SPEED, up_neighbor,   10, MPI_COMM_WORLD, &req[0]);             // 上 halo
+        MPI_Irecv(cells+(params.ny-1)*params.nx,params.nx, MPI_T_SPEED, down_neighbor, 11, MPI_COMM_WORLD, &req[1]);             // 下 halo
+        // MPI_Isend第一个参数是发送缓冲区的起始地址（跳过第一行halo行）
+        MPI_Isend(cells+params.nx,              params.nx, MPI_T_SPEED, up_neighbor,   11, MPI_COMM_WORLD, &req[2]);             // 发送第一真实行
+        MPI_Isend(cells+(params.ny-2)*params.nx,params.nx, MPI_T_SPEED, down_neighbor, 10, MPI_COMM_WORLD, &req[3]);             // 发送最后真实行
 
-        // 这里发送的部分有问题,解决了，是因为传输的结构定义错误！应该要自定义
+        // (B) 先算内部行 (2 .. ny‑3)，可与网路传输并行
+        // 这个do_accel参数很重要，防止重复加速，对于最后一个进程，只需要在这里加速一次即可，在后续依赖halo的部分不需要加速
+        float tot_u_in  = fusion_more(params, cells, tmp_cells, obstacles,
+                                      w11, w22, c_sq, w0, w1, w2,
+                                      divideVal, divideVal2,
+                                      ThisRank, ProcessSize,
+                /*rowStart*/2, /*rowEnd*/params.ny-3, 1);
 
-//        一次调用同时完成一个发送和一个接收，常用来做双向halo交换：指定发送缓冲区、
-//        目标rank、标签，同时指定接收缓冲区、来源rank、标签。属于阻塞发送/阻塞接收：返回时发送缓冲区已可安全重用，接收缓冲区已写满；
-//        、但不能保证对方也已完成它自己的Recv/Send。消息在同一(src,dst,tag,comm)通道内按发送顺序到达，MPI保证不丢包。
-        MPI_Sendrecv(cells+params.nx, params.nx, MPI_T_SPEED, up_neighbor, 0,
-                     cells+(params.ny-1)*params.nx, params.nx, MPI_T_SPEED, down_neighbor, 0,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-        // send to down neighbor and receive from up neighbor
-        MPI_Sendrecv(cells+(params.ny-2)*params.nx, params.nx, MPI_T_SPEED, down_neighbor, 0,
-                     cells, params.nx, MPI_T_SPEED, up_neighbor, 0,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        int completed = 0;
 
-        av_vels[tt] = fusion_more(params, cells, tmp_cells, obstacles, w11, w22, c_sq, w0, w1, w2,divideVal,divideVal2,ThisRank,ProcessSize);
+//        这个函数是本地操作（local operation），意味着它不会涉及进程间的通信，只检查本地进程的请求状态。它常用于轮询（polling）场景中，例如在循环中反复检查操作进度，而不阻塞程序执行。
+//        在你的调用中：
+//
+//        它检查 4 个请求（req 数组中的元素）。
+//        如果所有请求完成，将 completed 设置为 1（true）。
+        MPI_Testall(4, req, &completed, MPI_STATUSES_IGNORE);
 
-        // 每100个时间步输出一次动画数据
+        float tot_u_bd = 0.f;
+        
+        /* 异步优化：根据MPI通信状态选择使用新halo或旧halo数据 */
+        if (completed) {
+            /* 通信已完成：使用新的halo数据并更新旧halo */
+            if (halo_initialized) {
+                // 保存当前halo作为下次使用的old_halo
+                memcpy(old_halo_top, cells, sizeof(t_speed) * params.nx);
+                memcpy(old_halo_bottom, cells + (params.ny-1)*params.nx, sizeof(t_speed) * params.nx);
+            }
+            
+            // 使用新halo数据处理边界
+            tot_u_bd = fusion_more(params, cells, tmp_cells, obstacles,
+                                    w11, w22, c_sq, w0, w1, w2,
+                                    divideVal, divideVal2,
+                                    ThisRank, ProcessSize, 1, 1, 0);
+            tot_u_bd += fusion_more(params, cells, tmp_cells, obstacles,
+                                     w11, w22, c_sq, w0, w1, w2,
+                                     divideVal, divideVal2,
+                                     ThisRank, ProcessSize, params.ny - 2, params.ny - 2, 0);
+            
+            halo_initialized = 1;  // 标记halo已初始化
+        } else if (halo_initialized) {
+            /* 通信未完成但有旧halo：使用旧halo数据 */
+            tot_u_bd = fusion_more_with_halo(params, cells, tmp_cells, obstacles,
+                                           w11, w22, c_sq, w0, w1, w2,
+                                           divideVal, divideVal2,
+                                           ThisRank, ProcessSize, 1, 1, 0,
+                                           old_halo_top, old_halo_bottom);
+            tot_u_bd += fusion_more_with_halo(params, cells, tmp_cells, obstacles,
+                                            w11, w22, c_sq, w0, w1, w2,
+                                            divideVal, divideVal2,
+                                            ThisRank, ProcessSize, params.ny - 2, params.ny - 2, 0,
+                                            old_halo_top, old_halo_bottom);
+        } else {
+            /* 第一次循环且通信未完成：使用初始化的halo数据实现完全异步 */
+            if (!halo_initialized) {
+                // 使用初始化的密度值填充old_halo，实现真正的异步计算
+                float w0_init = params.density * 4.f / 9.f;
+                float w1_init = params.density / 9.f;
+                float w2_init = params.density / 36.f;
+                
+                // 用初始密度值填充old_halo
+                for (int ii = 0; ii < params.nx; ii++) {
+                    old_halo_top[ii].speeds[0] = w0_init;
+                    old_halo_top[ii].speeds[1] = w1_init;
+                    old_halo_top[ii].speeds[2] = w1_init;
+                    old_halo_top[ii].speeds[3] = w1_init;
+                    old_halo_top[ii].speeds[4] = w1_init;
+                    old_halo_top[ii].speeds[5] = w2_init;
+                    old_halo_top[ii].speeds[6] = w2_init;
+                    old_halo_top[ii].speeds[7] = w2_init;
+                    old_halo_top[ii].speeds[8] = w2_init;
+                    
+                    old_halo_bottom[ii].speeds[0] = w0_init;
+                    old_halo_bottom[ii].speeds[1] = w1_init;
+                    old_halo_bottom[ii].speeds[2] = w1_init;
+                    old_halo_bottom[ii].speeds[3] = w1_init;
+                    old_halo_bottom[ii].speeds[4] = w1_init;
+                    old_halo_bottom[ii].speeds[5] = w2_init;
+                    old_halo_bottom[ii].speeds[6] = w2_init;
+                    old_halo_bottom[ii].speeds[7] = w2_init;
+                    old_halo_bottom[ii].speeds[8] = w2_init;
+                }
+                halo_initialized = 1;
+            }
+            
+            // 使用初始化的old_halo进行完全异步计算
+            tot_u_bd = fusion_more_with_halo(params, cells, tmp_cells, obstacles,
+                                           w11, w22, c_sq, w0, w1, w2,
+                                           divideVal, divideVal2,
+                                           ThisRank, ProcessSize, 1, 1, 0,
+                                           old_halo_top, old_halo_bottom);
+            tot_u_bd += fusion_more_with_halo(params, cells, tmp_cells, obstacles,
+                                            w11, w22, c_sq, w0, w1, w2,
+                                            divideVal, divideVal2,
+                                            ThisRank, ProcessSize, params.ny - 2, params.ny - 2, 0,
+                                            old_halo_top, old_halo_bottom);
+        }
+
+        // 合并计算结果
+        av_vels[tt] = tot_u_in + tot_u_bd;
+
+//        // 每100个时间步输出一次动画数据
 //        if (tt % 100 == 0) {
 //            write_animation_data_mpi(params, tmp_cells, tt, obstacles, ThisRank, ProcessSize,
 //                                     KeepTotalRows, obstacles_Total, MPI_T_SPEED);
 //        }
 
-        // swap the pointers between cells and tmp_cells
-        t_speed* temp;
-        temp = cells;
-        cells = tmp_cells;
-        tmp_cells = temp;
-
-        // after swap, cells's value from 0 to nx is not initialized, make sure you don't use them
+        t_speed* temp = cells;   // pointer swap
+        cells          = tmp_cells;
+        tmp_cells      = temp;
     }
 
     /* Compute time stops here, collate time starts*/
     gettimeofday(&timstr, NULL);
     comp_toc = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
     col_tic=comp_toc;
-
-    // Collate data from ranks here
-
-    // 下面的结果如果和上面不一样，说明拷贝出了问题！
 
     // 主进程在这回收数据, 回收的时候要注意，每个cells只有一部分是真正的数据，还有两行是halo
     // 回收cells，并且放到results中
@@ -298,7 +406,7 @@ int main(int argc, char* argv[])
     float total_av_vels[params.maxIters];
     // 这行代码的作用是让所有进程把自己 av_vels 数组里的浮点值按元素位置做「求和」运算，
     // 并把结果汇总到秩为0 的进程上的 total_av_vels 数组中。具体含义：
-    // total_avels：只有当进程秩（rank）为 0 时才写入规约结果，其他进程对此参数可忽略
+    // total_avels：只有当进程秩（rank）为0 时才写入规约结果，其他进程对此参数可忽略
     MPI_Reduce(av_vels, total_av_vels, params.maxIters, MPI_FLOAT, MPI_SUM, 0, MPI_COMM_WORLD);
 
     if (ThisRank == 0){
@@ -325,6 +433,16 @@ int main(int argc, char* argv[])
         printf("Elapsed Total time:\t\t\t%.6lf (s)\n",   tot_toc  - tot_tic);
         write_values(params, results, obstacles_Total, av_vels);
     }
+    /* 清理异步优化相关内存 */
+//    if (old_halo_top != NULL) {
+//        free(old_halo_top);
+//        old_halo_top = NULL;
+//    }
+//    if (old_halo_bottom != NULL) {
+//        free(old_halo_bottom);
+//        old_halo_bottom = NULL;
+//    }
+    
     finalise(&params, &cells, &tmp_cells, &obstacles, &av_vels, &results, &obstacles_Total);
     MPI_Finalize();
     return EXIT_SUCCESS;
@@ -332,14 +450,15 @@ int main(int argc, char* argv[])
 
 float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells,const int* obstacles, const float w11,const float w22,
                   const float c_sq, const float w0,const float w1,const float w2,
-                  const float divideVal,const float divideVal2, int ThisRank, int ProcessSize){
+                  const float divideVal,const float divideVal2, int ThisRank, int ProcessSize ,
+                  int rowStart, int rowEnd, int do_accel){
 
     /* modify the 2nd row of the grid */
     // accelerate flow!!!!!
     // if this is the last process
     // 这里只对最后一个进程进行加速操作
     // 如果是最后一个进程，那么对倒数第二行进行加速操作
-    if (ThisRank == ProcessSize-1 ){
+    if (do_accel==1 && ThisRank == ProcessSize-1 ){
         const int LastSecondRow = params.ny - 3;
         // LastSecondRow = 3
         for (int ii = 0; ii < params.nx; ii++)
@@ -374,7 +493,7 @@ float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells,const
     // jj index from 1 to params.ny-2
     // ii index from 0 to params.nx-1
     // 因为jj=0和最后一行是halo部分，是其他进程的halo数据，所以此进程要处理的数据从1开始到params.ny-2
-    for (int jj = 1; jj < params.ny-1; jj++)
+    for (int jj = rowStart; jj <= rowEnd; jj++)
     {
         for (int ii = 0; ii < params.nx; ii++)
         {
@@ -399,6 +518,241 @@ float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells,const
             keep[6]=cells[x_e + y_s*params.nx].speeds[6];
             keep[7]=cells[x_e + y_n*params.nx].speeds[7];
             keep[8]=cells[x_w + y_n*params.nx].speeds[8];
+
+            /* if the cell contains an obstacle */
+            if (!obstacles[(jj-1)*params.nx + ii])
+            {
+                //collision()!!!!!!!!!!!!
+                /* compute local density total */
+                float local_density = 0.f;
+
+                for (int kk = 0; kk < NSPEEDS; kk++)
+                {
+                    local_density += keep[kk];
+                }
+
+                /* compute x velocity component */
+                float u_x = (keep[1]
+                             + keep[5]
+                             + keep[8]
+                             - (keep[3]
+                                + keep[6]
+                                + keep[7]))
+                            / local_density;
+                /* compute y velocity component */
+                float u_y = (keep[2]
+                             + keep[5]
+                             + keep[6]
+                             - (keep[4]
+                                + keep[7]
+                                + keep[8]))
+                            / local_density;
+
+                /* velocity squared */
+                const float u_sq = u_x * u_x + u_y * u_y;
+
+                /* directional velocity components */
+                float u[NSPEEDS];
+                u[1] =   u_x;        /* east */
+                u[2] =   u_y;  /* north */
+                u[3] = - u_x;        /* west */
+                u[4] = - u_y;  /* south */
+                u[5] =   u_x + u_y;  /* north-east */
+                u[6] = - u_x + u_y;  /* north-west */
+                u[7] = - u_x - u_y;  /* south-west */
+                u[8] =   u_x - u_y;  /* south-east */
+
+                /* equilibrium densities */
+                float d_equ[NSPEEDS];
+                /* zero velocity density: weight w0 */
+                d_equ[0] = w0 * local_density
+                           * (1.f - u_sq / (2.f * c_sq));
+
+                const float w1Local = w1 * local_density;
+                const float w2Local = w2 * local_density;
+                const float val = u_sq / divideVal2;
+                /* axis speeds: weight w1 */
+                d_equ[1] = w1Local * (1.f + u[1] / c_sq
+                                      + (u[1] * u[1]) / divideVal
+                                      - val );
+                d_equ[2] = w1Local * (1.f + u[2] / c_sq
+                                      + (u[2] * u[2]) / divideVal
+                                      - val);
+                d_equ[3] = w1Local * (1.f + u[3] / c_sq
+                                      + (u[3] * u[3]) / divideVal
+                                      - val);
+                d_equ[4] = w1Local * (1.f + u[4] / c_sq
+                                      + (u[4] * u[4]) / divideVal
+                                      - val);
+                /* diagonal speeds: weight w2 */
+                d_equ[5] = w2Local * (1.f + u[5] / c_sq
+                                      + (u[5] * u[5]) / divideVal
+                                      - val);
+                d_equ[6] = w2Local * (1.f + u[6] / c_sq
+                                      + (u[6] * u[6]) / divideVal
+                                      - val);
+                d_equ[7] = w2Local * (1.f + u[7] / c_sq
+                                      + (u[7] * u[7]) / divideVal
+                                      - val);
+                d_equ[8] = w2Local * (1.f + u[8] / c_sq
+                                      + (u[8] * u[8]) / divideVal
+                                      - val);
+
+                /* relaxation step */
+                for (int kk = 0; kk < NSPEEDS; kk++)
+                {
+                    tmp_cells[ii + jj*params.nx].speeds[kk] = keep[kk]
+                                                              + params.omega
+                                                                * (d_equ[kk] - keep[kk]);
+                }
+
+                // av_velocity()!!!
+                /* local density total */
+                local_density = 0.f;
+
+                for (int kk = 0; kk < NSPEEDS; kk++)
+                {
+                    local_density += tmp_cells[ii + jj*params.nx].speeds[kk];
+                }
+
+                /* x-component of velocity */
+                u_x = (tmp_cells[ii + jj*params.nx].speeds[1]
+                       + tmp_cells[ii + jj*params.nx].speeds[5]
+                       + tmp_cells[ii + jj*params.nx].speeds[8]
+                       - (tmp_cells[ii + jj*params.nx].speeds[3]
+                          + tmp_cells[ii + jj*params.nx].speeds[6]
+                          + tmp_cells[ii + jj*params.nx].speeds[7]))
+                      / local_density;
+                /* compute y velocity component */
+                u_y = (tmp_cells[ii + jj*params.nx].speeds[2]
+                       + tmp_cells[ii + jj*params.nx].speeds[5]
+                       + tmp_cells[ii + jj*params.nx].speeds[6]
+                       - (tmp_cells[ii + jj*params.nx].speeds[4]
+                          + tmp_cells[ii + jj*params.nx].speeds[7]
+                          + tmp_cells[ii + jj*params.nx].speeds[8]))
+                      / local_density;
+                /* accumulate the norm of x- and y- velocity components */
+                tot_u += sqrtf((u_x * u_x) + (u_y * u_y));
+            }else{
+                //rebound()!!!!!!!!!!!
+                /* called after propagate, so taking values from scratch space
+                ** mirroring, and writing into main grid */
+
+                // 注意如果是rebound，他的speeds[0]是不变的
+                tmp_cells[ii + jj*params.nx].speeds[1] = keep[3];
+                tmp_cells[ii + jj*params.nx].speeds[2] = keep[4];
+                tmp_cells[ii + jj*params.nx].speeds[3] = keep[1];
+                tmp_cells[ii + jj*params.nx].speeds[4] = keep[2];
+                tmp_cells[ii + jj*params.nx].speeds[5] = keep[7];
+                tmp_cells[ii + jj*params.nx].speeds[6] = keep[8];
+                tmp_cells[ii + jj*params.nx].speeds[7] = keep[5];
+                tmp_cells[ii + jj*params.nx].speeds[8] = keep[6];
+            }
+        }
+    }
+    return tot_u;
+}
+
+/* 使用外部halo数据的融合计算函数 */
+float fusion_more_with_halo(const t_param params, t_speed* cells, t_speed* tmp_cells,
+                           const int* obstacles, const float w11, const float w22,
+                           const float c_sq, const float w0, const float w1, const float w2,
+                           const float divideVal, const float divideVal2,
+                           int ThisRank, int ProcessSize,
+                           int rowStart, int rowEnd, int do_accel,
+                           t_speed* halo_top, t_speed* halo_bottom)
+{
+    /* 使用旧halo数据版本的融合计算 */
+    
+    /* modify the 2nd row of the grid */
+    // accelerate flow!!!!!
+    // if this is the last process
+    // 这里只对最后一个进程进行加速操作
+    // 如果是最后一个进程，那么对倒数第二行进行加速操作
+    if (do_accel==1 && ThisRank == ProcessSize-1 ){
+        const int LastSecondRow = params.ny - 3;
+        // LastSecondRow = 3
+        for (int ii = 0; ii < params.nx; ii++)
+        {
+            /* if the cell is not occupied and
+            ** we don't send a negative density */
+
+            // 这里注意一下，障碍物索引
+            if (!obstacles[ii + (LastSecondRow-1)*params.nx]
+                && (cells[ii + LastSecondRow*params.nx].speeds[3] - w11) > 0.f
+                && (cells[ii + LastSecondRow*params.nx].speeds[6] - w22) > 0.f
+                && (cells[ii + LastSecondRow*params.nx].speeds[7] - w22) > 0.f)
+            {
+                /* increase 'east-side' densities */
+                cells[ii + LastSecondRow*params.nx].speeds[1] += w11;
+                cells[ii + LastSecondRow*params.nx].speeds[5] += w22;
+                cells[ii + LastSecondRow*params.nx].speeds[8] += w22;
+                /* decrease 'west-side' densities */
+                cells[ii + LastSecondRow*params.nx].speeds[3] -= w11;
+                cells[ii + LastSecondRow*params.nx].speeds[6] -= w22;
+                cells[ii + LastSecondRow*params.nx].speeds[7] -= w22;
+            }
+        }
+    }
+
+    //all above is accelerate_flow()!!!!!
+    float tot_u;          /* accumulated magnitudes of velocity for each cell */
+    /* initialise */
+    tot_u = 0.f;
+
+    /* loop over _all_ cells */
+    // jj index from 1 to params.ny-2
+    // ii index from 0 to params.nx-1
+    // 因为jj=0和最后一行是halo部分，是其他进程的halo数据，所以此进程要处理的数据从1开始到params.ny-2
+    for (int jj = rowStart; jj <= rowEnd; jj++)
+    {
+        for (int ii = 0; ii < params.nx; ii++)
+        {
+            // propagate()!!!!
+            /* determine indices of axis-direction neighbours
+            ** respecting periodic boundary conditions (wrap around) */
+            const int y_n = (jj + 1) % params.ny;
+            const int x_e = (ii + 1) % params.nx;
+            const int y_s = jj - 1;
+            const int x_w = (ii == 0) ? (ii + params.nx - 1) : (ii - 1);
+            
+            /* 关键修改：使用外部halo数据 */
+            float keep[9];
+            keep[0] = cells[ii + jj*params.nx].speeds[0];
+            keep[1] = cells[x_w + jj*params.nx].speeds[1];
+            
+            /* 根据访问位置选择数据源 */
+            if (y_s == -1) {
+                // 访问上halo，使用提供的halo_top数据
+                keep[2] = halo_top[ii].speeds[2];
+            } else {
+                keep[2] = cells[ii + y_s*params.nx].speeds[2];
+            }
+            
+            keep[3] = cells[x_e + jj*params.nx].speeds[3];
+            
+            if (y_n >= params.ny) {
+                // 访问下halo，使用提供的halo_bottom数据
+                keep[4] = halo_bottom[ii].speeds[4];
+            } else {
+                keep[4] = cells[ii + y_n*params.nx].speeds[4];
+            }
+            
+            if (y_s == -1) {
+                keep[5] = halo_top[x_w].speeds[5];
+                keep[6] = halo_top[x_e].speeds[6];
+            } else {
+                keep[5] = cells[x_w + y_s*params.nx].speeds[5];
+                keep[6] = cells[x_e + y_s*params.nx].speeds[6];
+            }
+            
+            if (y_n >= params.ny) {
+                keep[7] = halo_bottom[x_e].speeds[7];
+                keep[8] = halo_bottom[x_w].speeds[8];
+            } else {
+                keep[7] = cells[x_e + y_n*params.nx].speeds[7];
+                keep[8] = cells[x_w + y_n*params.nx].speeds[8];
+            }
 
             /* if the cell contains an obstacle */
             if (!obstacles[(jj-1)*params.nx + ii])
@@ -722,6 +1076,27 @@ int initialise(const char* paramfile, const char* obstaclefile,
             (*cells_ptr)[ii + jj*params->nx].speeds[6] = w2;
             (*cells_ptr)[ii + jj*params->nx].speeds[7] = w2;
             (*cells_ptr)[ii + jj*params->nx].speeds[8] = w2;
+
+        }
+    }
+
+    // 同样初始化tmp_cells，保持与cells相同的初始状态
+    for (int jj = 0; jj < rows_per_process+2; jj++)
+    {
+        for (int ii = 0; ii < params->nx; ii++)
+        {
+            /* centre */
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[0] = w0;
+            /* axis directions */
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[1] = w1;
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[2] = w1;
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[3] = w1;
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[4] = w1;
+            /* diagonals */
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[5] = w2;
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[6] = w2;
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[7] = w2;
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[8] = w2;
 
         }
     }

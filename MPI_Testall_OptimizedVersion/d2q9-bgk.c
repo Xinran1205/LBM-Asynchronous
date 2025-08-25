@@ -97,8 +97,15 @@ int initialise(const char* paramfile, const char* obstaclefile,
 */
 int timestep(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obstacles);
 int write_values(const t_param params, t_speed* cells, int* obstacles, float* av_vels);
-float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells, const int* obstacles, float w11, float w22,
-                  float c_sq, float w0, float w1, float w2, float divideVal, float divideVal2, int ThisRank,int ProcessSize);
+//float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells, const int* obstacles, float w11, float w22,
+//                  float c_sq, float w0, float w1, float w2, float divideVal, float divideVal2, int ThisRank,int ProcessSize);
+
+float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells,
+                  const int* obstacles, float w11, float w22,
+                  float c_sq, float w0, float w1, float w2,
+                  float divideVal, float divideVal2,
+                  int ThisRank, int ProcessSize,
+                  int rowStart, int rowEnd,int do_accel);
 
 /* finalise, including freeing up allocated memory */
 int finalise(const t_param* params, t_speed** cells_ptr, t_speed** tmp_cells_ptr,
@@ -118,10 +125,25 @@ float calc_reynolds(const t_param params, t_speed* cells, int* obstacles);
 void die(const char* message, const int line, const char* file);
 void usage(const char* exe);
 
-void write_animation_data_mpi(const t_param params, t_speed* cells, const int timestep,
-                              const int* obstacles, int ThisRank, int ProcessSize,
-                              int KeepTotalRows, const int* obstacles_Total,
-                              MPI_Datatype MPI_T_SPEED);
+/* animation output functions */
+
+/* animation data caching structure */
+typedef struct {
+    t_speed* data;           /* cached cell data */
+    int timestep;           /* timestep number */
+    int is_valid;           /* whether this cache entry is valid */
+} animation_cache_entry;
+
+void cache_animation_data(animation_cache_entry* cache, int cache_index, 
+                         t_speed* cells, int timestep, int local_data_size, int nx, int max_cache_size);
+void write_cached_animation_data(animation_cache_entry* cache, int cache_size,
+                                const t_param params, const int* obstacles, 
+                                int ThisRank, int ProcessSize, int KeepTotalRows,
+                                const int* obstacles_Total, MPI_Datatype MPI_T_SPEED);
+void write_single_cached_frame(t_speed* cached_data, int timestep, int local_data_size,
+                              const t_param params, const int* obstacles,
+                              int ThisRank, int ProcessSize, int KeepTotalRows,
+                              const int* obstacles_Total, MPI_Datatype MPI_T_SPEED);
 
 /*
 ** main program:
@@ -165,6 +187,11 @@ int main(int argc, char* argv[])
     int* obstacles_Total = NULL;
     int numberOfNonObstacles = 0;
 
+    /* animation data caching */
+    const int ANIMATION_INTERVAL = 100;  /* 每100个时间步收集一次 */
+    int ANIMATION_CACHE_SIZE;  /* 动态计算缓存大小 */
+    animation_cache_entry* animation_cache = NULL;
+
     /* parse the command line */
     if (argc != 3)
     {
@@ -185,6 +212,25 @@ int main(int argc, char* argv[])
     initialise(paramfile, obstaclefile, &params, &cells, &tmp_cells ,&results, &obstacles, &av_vels, ThisRank,ProcessSize,&KeepTotalRows
             ,&obstacles_Total, &numberOfNonObstacles);
 
+    /* Calculate animation cache size based on maxIters */
+    ANIMATION_CACHE_SIZE = (params.maxIters / ANIMATION_INTERVAL) + 1;
+    
+    /* Initialize animation cache */
+    animation_cache = (animation_cache_entry*)malloc(sizeof(animation_cache_entry) * ANIMATION_CACHE_SIZE);
+    if (animation_cache == NULL) {
+        die("cannot allocate memory for animation cache", __LINE__, __FILE__);
+    }
+    for (int i = 0; i < ANIMATION_CACHE_SIZE; i++) {
+        animation_cache[i].data = NULL;
+        animation_cache[i].timestep = -1;
+        animation_cache[i].is_valid = 0;
+    }
+    
+//    if (ThisRank == 0) {
+//        printf("Animation: Will collect data every %d timesteps (%d total frames)\n",
+//               ANIMATION_INTERVAL, ANIMATION_CACHE_SIZE);
+//    }
+
     const float w11 = params.density * params.accel / 9.f;
     const float w22 = params.density * params.accel / 36.f;
     const float c_sq = 1.f / 3.f; /* square of speed of sound */
@@ -204,47 +250,60 @@ int main(int argc, char* argv[])
 
     for(int tt = 0; tt < params.maxIters; tt++)
     {
-        // 上下是连着的，但是左右不是连着的
-        // each iteration, we need to do halo exchange to update the boundary values for each process
-        // Halo exchange
         int up_neighbor = (ThisRank - 1 + ProcessSize) % ProcessSize;
         int down_neighbor = (ThisRank + 1) % ProcessSize;
 
-        // param.nx 是有多少列, param.ny现在的值是每个进程cells的整个行数，包括halo
-        // 真正数据存储在cells[param.nx]到cells[param.nx+（param.ny-2）*param.nx]之间
-        // 中，前param.nx个元素用来存储上边界，后param.nx个元素用来存储下边界
+        // *** MOD ➋: 非阻塞通信 + 计算重叠
+        // req是返回的句柄，用于后续查询或等待这条非阻塞操作完成。
+        MPI_Request req[4];
 
-        // send to up neighbor and receive from down neighbor
+        // 10和11是tag 整型标签，用来区分不同消息。必须在收发两端匹配。
+        // (A) post non‑blocking halo exchange
+        // MPI_Isend第一个参数是发送缓冲区的起始地址（跳过第一行halo行）
+        MPI_Isend(cells+params.nx,              params.nx, MPI_T_SPEED, up_neighbor,   11, MPI_COMM_WORLD, &req[2]);             // 发送第一真实行
+        MPI_Isend(cells+(params.ny-2)*params.nx,params.nx, MPI_T_SPEED, down_neighbor, 10, MPI_COMM_WORLD, &req[3]);             // 发送最后真实行
 
-        // 这里发送的部分有问题,解决了，是因为传输的结构定义错误！应该要自定义
+        // MPI_Irecv第一个参数是接收缓冲区的起始地址
+        MPI_Irecv(cells,                        params.nx, MPI_T_SPEED, up_neighbor,   10, MPI_COMM_WORLD, &req[0]);             // 上 halo
+        MPI_Irecv(cells+(params.ny-1)*params.nx,params.nx, MPI_T_SPEED, down_neighbor, 11, MPI_COMM_WORLD, &req[1]);             // 下 halo
 
-//        一次调用同时完成一个发送和一个接收，常用来做双向halo交换：指定发送缓冲区、
-//        目标rank、标签，同时指定接收缓冲区、来源rank、标签。属于阻塞发送/阻塞接收：返回时发送缓冲区已可安全重用，接收缓冲区已写满；
-//        、但不能保证对方也已完成它自己的Recv/Send。消息在同一(src,dst,tag,comm)通道内按发送顺序到达，MPI保证不丢包。
-        MPI_Sendrecv(cells+params.nx, params.nx, MPI_T_SPEED, up_neighbor, 0,
-                     cells+(params.ny-1)*params.nx, params.nx, MPI_T_SPEED, down_neighbor, 0,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        // (B) 先算内部行 (2 .. ny‑3)，可与网路传输并行
+        // 这个do_accel参数很重要，防止重复加速，对于最后一个进程，只需要在这里加速一次即可，在后续依赖halo的部分不需要加速
+        float tot_u_in  = fusion_more(params, cells, tmp_cells, obstacles,
+                                      w11, w22, c_sq, w0, w1, w2,
+                                      divideVal, divideVal2,
+                                      ThisRank, ProcessSize,
+                /*rowStart*/2, /*rowEnd*/params.ny-3, 1);
 
-        // send to down neighbor and receive from up neighbor
-        MPI_Sendrecv(cells+(params.ny-2)*params.nx, params.nx, MPI_T_SPEED, down_neighbor, 0,
-                     cells, params.nx, MPI_T_SPEED, up_neighbor, 0,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-        av_vels[tt] = fusion_more(params, cells, tmp_cells, obstacles, w11, w22, c_sq, w0, w1, w2,divideVal,divideVal2,ThisRank,ProcessSize);
+        int completed = 0;
+        MPI_Testall(4, req, &completed, MPI_STATUSES_IGNORE);
 
-        // 每100个时间步输出一次动画数据
-//        if (tt % 100 == 0) {
-//            write_animation_data_mpi(params, tmp_cells, tt, obstacles, ThisRank, ProcessSize,
-//                                     KeepTotalRows, obstacles_Total, MPI_T_SPEED);
+        // (D) 再算依赖 halo 的边界行 1 与 ny‑2
+        float tot_u_bd  = fusion_more(params, cells, tmp_cells, obstacles,
+                                      w11, w22, c_sq, w0, w1, w2,
+                                      divideVal, divideVal2,
+                                      ThisRank, ProcessSize, 1, 1, 0);
+        tot_u_bd +=      fusion_more(params, cells, tmp_cells, obstacles,
+                                     w11, w22, c_sq, w0, w1, w2,
+                                     divideVal, divideVal2,
+                                     ThisRank, ProcessSize, params.ny-2, params.ny-2, 0);
+
+        // (E) 汇总本轮速度并交换指针
+        av_vels[tt] = tot_u_in + tot_u_bd;
+
+        // 每100个时间步缓存动画数据（无MPI通信，不影响计算精度）
+//        if (tt % ANIMATION_INTERVAL == 0 || tt == params.maxIters - 1) {
+//            int cache_index = tt / ANIMATION_INTERVAL;
+//            if (cache_index >= ANIMATION_CACHE_SIZE) cache_index = ANIMATION_CACHE_SIZE - 1;
+//
+//            int local_data_size = (params.ny - 2) * params.nx;
+//            cache_animation_data(animation_cache, cache_index, tmp_cells, tt, local_data_size, params.nx, ANIMATION_CACHE_SIZE);
 //        }
 
-        // swap the pointers between cells and tmp_cells
-        t_speed* temp;
-        temp = cells;
-        cells = tmp_cells;
-        tmp_cells = temp;
-
-        // after swap, cells's value from 0 to nx is not initialized, make sure you don't use them
+        t_speed* temp = cells;   // pointer swap
+        cells          = tmp_cells;
+        tmp_cells      = temp;
     }
 
     /* Compute time stops here, collate time starts*/
@@ -252,9 +311,16 @@ int main(int argc, char* argv[])
     comp_toc = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
     col_tic=comp_toc;
 
+    // 在主计算完成后输出所有缓存的动画数据，不影响计算精度
+//    if (ThisRank == 0) {
+//        printf("Main computation completed. Writing cached animation data...\n");
+//    }
+//    write_cached_animation_data(animation_cache, ANIMATION_CACHE_SIZE, params, obstacles,
+//                               ThisRank, ProcessSize, KeepTotalRows, obstacles_Total, MPI_T_SPEED);
+
     // Collate data from ranks here
 
-    // 下面的结果如果和上面不一样，说明拷贝出了问题！
+    //如果下面的结果如果和上面不一样，说明拷贝出了问题！
 
     // 主进程在这回收数据, 回收的时候要注意，每个cells只有一部分是真正的数据，还有两行是halo
     // 回收cells，并且放到results中
@@ -298,7 +364,7 @@ int main(int argc, char* argv[])
     float total_av_vels[params.maxIters];
     // 这行代码的作用是让所有进程把自己 av_vels 数组里的浮点值按元素位置做「求和」运算，
     // 并把结果汇总到秩为0 的进程上的 total_av_vels 数组中。具体含义：
-    // total_avels：只有当进程秩（rank）为 0 时才写入规约结果，其他进程对此参数可忽略
+    // total_avels：只有当进程秩（rank）为0 时才写入规约结果，其他进程对此参数可忽略
     MPI_Reduce(av_vels, total_av_vels, params.maxIters, MPI_FLOAT, MPI_SUM, 0, MPI_COMM_WORLD);
 
     if (ThisRank == 0){
@@ -325,6 +391,14 @@ int main(int argc, char* argv[])
         printf("Elapsed Total time:\t\t\t%.6lf (s)\n",   tot_toc  - tot_tic);
         write_values(params, results, obstacles_Total, av_vels);
     }
+    /* Clean up animation cache */
+    for (int i = 0; i < ANIMATION_CACHE_SIZE; i++) {
+        if (animation_cache[i].data != NULL) {
+            free(animation_cache[i].data);
+        }
+    }
+    free(animation_cache);
+
     finalise(&params, &cells, &tmp_cells, &obstacles, &av_vels, &results, &obstacles_Total);
     MPI_Finalize();
     return EXIT_SUCCESS;
@@ -332,14 +406,15 @@ int main(int argc, char* argv[])
 
 float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells,const int* obstacles, const float w11,const float w22,
                   const float c_sq, const float w0,const float w1,const float w2,
-                  const float divideVal,const float divideVal2, int ThisRank, int ProcessSize){
+                  const float divideVal,const float divideVal2, int ThisRank, int ProcessSize ,
+                  int rowStart, int rowEnd, int do_accel){
 
     /* modify the 2nd row of the grid */
     // accelerate flow!!!!!
     // if this is the last process
     // 这里只对最后一个进程进行加速操作
     // 如果是最后一个进程，那么对倒数第二行进行加速操作
-    if (ThisRank == ProcessSize-1 ){
+    if (do_accel==1 && ThisRank == ProcessSize-1 ){
         const int LastSecondRow = params.ny - 3;
         // LastSecondRow = 3
         for (int ii = 0; ii < params.nx; ii++)
@@ -374,7 +449,7 @@ float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells,const
     // jj index from 1 to params.ny-2
     // ii index from 0 to params.nx-1
     // 因为jj=0和最后一行是halo部分，是其他进程的halo数据，所以此进程要处理的数据从1开始到params.ny-2
-    for (int jj = 1; jj < params.ny-1; jj++)
+    for (int jj = rowStart; jj <= rowEnd; jj++)
     {
         for (int ii = 0; ii < params.nx; ii++)
         {
@@ -726,6 +801,27 @@ int initialise(const char* paramfile, const char* obstaclefile,
         }
     }
 
+    // 同样初始化tmp_cells，保持与cells相同的初始状态
+    for (int jj = 0; jj < rows_per_process+2; jj++)
+    {
+        for (int ii = 0; ii < params->nx; ii++)
+        {
+            /* centre */
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[0] = w0;
+            /* axis directions */
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[1] = w1;
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[2] = w1;
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[3] = w1;
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[4] = w1;
+            /* diagonals */
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[5] = w2;
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[6] = w2;
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[7] = w2;
+            (*tmp_cells_ptr)[ii + jj*params->nx].speeds[8] = w2;
+
+        }
+    }
+
     /* the map of obstacles */
     if (ThisRank == 0){
         // initialize results
@@ -994,18 +1090,85 @@ void usage(const char* exe)
     exit(EXIT_FAILURE);
 }
 
-void write_animation_data_mpi(const t_param params, t_speed* cells, const int timestep,
-                              const int* obstacles, int ThisRank, int ProcessSize,
-                              int KeepTotalRows, const int* obstacles_Total,
-                              MPI_Datatype MPI_T_SPEED) {
+/* Animation data caching and output functions */
+
+/* Cache animation data locally without MPI communication */
+void cache_animation_data(animation_cache_entry* cache, int cache_index, 
+                         t_speed* cells, int timestep, int local_data_size, int nx, int max_cache_size) {
+    
+    if (cache_index < 0 || cache_index >= max_cache_size) return;  /* 防止越界 */
+    
+    /* Allocate memory for this cache entry if not already allocated */
+    if (cache[cache_index].data == NULL) {
+        cache[cache_index].data = (t_speed*)malloc(sizeof(t_speed) * local_data_size);
+        if (cache[cache_index].data == NULL) {
+            die("cannot allocate memory for animation cache data", __LINE__, __FILE__);
+        }
+    }
+    
+    /* Copy data correctly (skip halo rows: from row 1 to ny-2) */
+    /* 每个进程的cells数组布局：[halo][真实数据行1][真实数据行2]...[真实数据行n][halo] */
+    /* 需要跳过第一行halo，拷贝中间的真实数据行 */
+    int rows_to_copy = local_data_size / nx;  /* 计算实际要拷贝的行数 */
+    
+    for (int row = 0; row < rows_to_copy; row++) {
+        for (int col = 0; col < nx; col++) {
+            /* 源：cells数组中跳过第一行halo后的数据 */
+            int src_index = (row + 1) * nx + col;  /* +1 跳过第一行halo */
+            /* 目标：缓存数组中的线性索引 */
+            int dst_index = row * nx + col;
+            
+            cache[cache_index].data[dst_index] = cells[src_index];
+        }
+    }
+    
+    cache[cache_index].timestep = timestep;
+    cache[cache_index].is_valid = 1;
+}
+
+/* Write all cached animation data using batch MPI communication */
+void write_cached_animation_data(animation_cache_entry* cache, int cache_size,
+                                const t_param params, const int* obstacles,
+                                int ThisRank, int ProcessSize, int KeepTotalRows,
+                                const int* obstacles_Total, MPI_Datatype MPI_T_SPEED) {
+
+    for (int cache_idx = 0; cache_idx < cache_size; cache_idx++) {
+        if (!cache[cache_idx].is_valid) continue;
+
+        if (ThisRank == 0) {
+            printf("Writing animation data for timestep %d (cache %d/%d)\n",
+                   cache[cache_idx].timestep, cache_idx + 1, cache_size);
+        }
+
+        /* Use specialized function for cached data */
+        int local_data_size = (params.ny - 2) * params.nx;
+        write_single_cached_frame(cache[cache_idx].data, cache[cache_idx].timestep, local_data_size,
+                                 params, obstacles, ThisRank, ProcessSize, KeepTotalRows,
+                                 obstacles_Total, MPI_T_SPEED);
+    }
+}
+
+/* Write single cached frame data (without halo rows) */
+void write_single_cached_frame(t_speed* cached_data, int timestep, int local_data_size,
+                              const t_param params, const int* obstacles,
+                              int ThisRank, int ProcessSize, int KeepTotalRows,
+                              const int* obstacles_Total, MPI_Datatype MPI_T_SPEED) {
 
     // 创建临时结果数组用于收集所有进程的数据
     t_speed* temp_results = NULL;
+    MPI_Request* recv_requests = NULL;
+    MPI_Request send_request;
 
     if (ThisRank == 0) {
         temp_results = (t_speed*)malloc(sizeof(t_speed) * KeepTotalRows * params.nx);
         if (temp_results == NULL) {
-            die("cannot allocate memory for temp_results in animation output", __LINE__, __FILE__);
+            die("cannot allocate memory for temp_results in cached frame output", __LINE__, __FILE__);
+        }
+        
+        // 为接收请求分配内存
+        recv_requests = (MPI_Request*)malloc(sizeof(MPI_Request) * (ProcessSize - 1));
+        if (recv_requests == NULL) {
+            die("cannot allocate memory for recv_requests in cached frame output", __LINE__, __FILE__);
         }
     }
 
@@ -1018,18 +1181,16 @@ void write_animation_data_mpi(const t_param params, t_speed* cells, const int ti
     if (ThisRank == ProcessSize - 1) {
         rows_per_process += 3;
     }
-    int local_data_size = rows_per_process * params.nx;
+    int expected_local_data_size = rows_per_process * params.nx;
 
-    // 数据收集
+    // 数据收集 - 使用非阻塞通信
     if (ThisRank == 0) {
-        // 主进程：先复制自己的数据（跳过halo行）
-        for (int i = 1; i < params.ny - 1; i++) {
-            for (int j = 0; j < params.nx; j++) {
-                temp_results[j + (i-1) * params.nx] = cells[j + i * params.nx];
-            }
+        // 主进程：直接复制自己的缓存数据
+        for (int i = 0; i < local_data_size; i++) {
+            temp_results[i] = cached_data[i];
         }
 
-        // 接收其他进程的数据
+        // 启动非阻塞接收其他进程的数据
         int offsetStart = local_data_size;
         for (int i = 1; i < ProcessSize; i++) {
             int other_rows = basic_work + (i < remainder ? 1 : 0);
@@ -1038,10 +1199,14 @@ void write_animation_data_mpi(const t_param params, t_speed* cells, const int ti
             }
             int other_size = other_rows * params.nx;
 
-            MPI_Recv(temp_results + offsetStart, other_size, MPI_T_SPEED, i, 100 + timestep,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            // 使用非阻塞接收，tag使用2000+timestep避免与主计算和其他动画输出冲突
+            MPI_Irecv(temp_results + offsetStart, other_size, MPI_T_SPEED, i, 2000 + timestep,
+                     MPI_COMM_WORLD, &recv_requests[i-1]);
             offsetStart += other_size;
         }
+
+        // 等待所有接收完成
+        MPI_Waitall(ProcessSize - 1, recv_requests, MPI_STATUSES_IGNORE);
 
         // 现在主进程有完整数据，开始写入动画文件
         char filename[256];
@@ -1049,7 +1214,7 @@ void write_animation_data_mpi(const t_param params, t_speed* cells, const int ti
 
         FILE* fp = fopen(filename, "w");
         if (fp == NULL) {
-            die("could not open animation data file", __LINE__, __FILE__);
+            die("could not open cached animation data file", __LINE__, __FILE__);
         }
 
         // 写入网格尺寸信息
@@ -1091,13 +1256,18 @@ void write_animation_data_mpi(const t_param params, t_speed* cells, const int ti
         }
 
         fclose(fp);
-        printf("Written animation data for timestep %d\n", timestep);
 
         // 释放临时内存
         free(temp_results);
+        free(recv_requests);
 
     } else {
-        // 其他进程：发送自己的数据（跳过halo行）
-        MPI_Send(cells + params.nx, local_data_size, MPI_T_SPEED, 0, 100 + timestep, MPI_COMM_WORLD);
+        // 其他进程：使用非阻塞发送自己的缓存数据
+        // tag使用2000+timestep避免与主计算和其他动画输出冲突
+        MPI_Isend(cached_data, local_data_size, MPI_T_SPEED, 0, 2000 + timestep, 
+                  MPI_COMM_WORLD, &send_request);
+        
+        // 等待发送完成
+        MPI_Wait(&send_request, MPI_STATUS_IGNORE);
     }
 }

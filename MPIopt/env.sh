@@ -1,1 +1,0 @@
-module load languages/intel/2020-u4

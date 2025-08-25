@@ -1,0 +1,24 @@
+#!/bin/bash
+#SBATCH --job-name=d2q9-bgk     # MPI专用名
+#SBATCH --nodes=2                  # 2节点
+#SBATCH --ntasks-per-node=40       # 每节点40进程（官方推荐）
+#SBATCH --cpus-per-task=1          # 每个进程1核
+#SBATCH --time=00:10:00
+#SBATCH --output=d2q9-bgk.out  # 输出文件
+#SBATCH --exclusive                # 独占
+
+# 加载MPI模块（参考官方，调整为你module）
+module load openmpi/5.0.0/gcc
+
+echo Running on host `hostname`
+echo Time is `date`
+echo Directory is `pwd`
+echo Slurm job ID is $SLURM_JOB_ID
+echo This job runs on the following machines:
+echo `echo $SLURM_JOB_NODELIST | uniq`
+
+# 用mpirun启动（官方示例）
+mpirun -n $SLURM_NTASKS ./d2q9-bgk input_128x128.params obstacles_128x128.dat
+#mpirun -n $SLURM_NTASKS ./d2q9-bgk input_128x256.params obstacles_128x256.dat
+#mpirun -n $SLURM_NTASKS ./d2q9-bgk input_256x256.params obstacles_256x256.dat
+#mpirun -n $SLURM_NTASKS ./d2q9-bgk input_1024x1024.params obstacles_1024x1024.dat

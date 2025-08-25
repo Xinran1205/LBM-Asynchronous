@@ -1,9 +1,9 @@
 *.o
 
-openmp/d2q9-bgk
+OpenMP/d2q9-bgk
 d2q9-bgk.out
-openmp/final_state.dat
-openmp/av_vels.dat
+OpenMP/final_state.dat
+OpenMP/av_vels.dat
 final_state.png
 
 # Prerequisites
