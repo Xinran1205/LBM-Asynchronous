@@ -2,8 +2,8 @@
 
 #SBATCH --job-name=d2q9-bgk
 #SBATCH --nodes=1
-#SBATCH --ntasks=1               # 只要 1 个进程/任务
-#SBATCH --cpus-per-task=40       # 给这个进程 40 个 CPU 核
+#SBATCH --ntasks=1               
+#SBATCH --cpus-per-task=40       
 #SBATCH --time=00:10:00
 #SBATCH --output=d2q9-bgk.out
 #SBATCH --exclusive 

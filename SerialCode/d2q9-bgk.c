@@ -168,7 +168,6 @@ int main(int argc, char* argv[])
         timestep(params, cells, tmp_cells, obstacles);
         av_vels[tt] = av_velocity(params, cells, obstacles);
 
-        // 每100个时间步输出一次动画数据
 //        if (tt % 100 == 0) {
 //            write_animation_data(params, cells, tt, obstacles);
 //        }
@@ -760,16 +759,16 @@ void usage(const char* exe)
 
 void write_velocity_data(const t_param params, t_speed* cells, const int timestep,
                          const int* obstacles) {
-    FILE* fp = fopen("velocity_per_timestep.dat", "a");  // 以追加模式打开文件
+    FILE* fp = fopen("velocity_per_timestep.dat", "a");  
 
     if (fp == NULL) {
         die("could not open velocity data file", __LINE__, __FILE__);
     }
 
-    // 将当前时间步和每个格点的速度信息写入文件
+
     for (int jj = 0; jj < params.ny; jj++) {
         for (int ii = 0; ii < params.nx; ii++) {
-            // 忽略障碍物格点
+
             if (!obstacles[ii + jj * params.nx]) {
                 float local_density = 0.f;
                 for (int kk = 0; kk < NSPEEDS; kk++) {
@@ -792,7 +791,6 @@ void write_velocity_data(const t_param params, t_speed* cells, const int timeste
                                 + cells[ii + jj * params.nx].speeds[8]))
                             / local_density;
 
-                // 写入时间步、格点位置和速度数据
                 fprintf(fp, "%d %d %d %.12E %.12E\n", timestep, ii, jj, u_x, u_y);
             }
         }
@@ -811,15 +809,12 @@ void write_animation_data(const t_param params, t_speed* cells, const int timest
         die("could not open animation data file", __LINE__, __FILE__);
     }
 
-    // 写入网格尺寸信息
     fprintf(fp, "# nx=%d ny=%d timestep=%d\n", params.nx, params.ny, timestep);
 
-    // 为每个格点计算并写入velocity magnitude
     for (int jj = 0; jj < params.ny; jj++) {
         for (int ii = 0; ii < params.nx; ii++) {
             float velocity_magnitude = 0.0f;
 
-            // 如果不是障碍物，计算velocity magnitude
             if (!obstacles[ii + jj * params.nx]) {
                 float local_density = 0.f;
                 for (int kk = 0; kk < NSPEEDS; kk++) {

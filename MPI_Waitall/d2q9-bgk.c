@@ -141,21 +141,21 @@ int main(int argc, char* argv[])
     int ThisRank, ProcessSize;
 
     MPI_Init(&argc, &argv);
-    // 在MPI本地环境中获取进程数量和当前进程的rank
-    // 并将其存储在 ThisRank 和 ProcessSize 中
+    // Get the number of processes and current process rank in MPI environment
+    // and store them in ThisRank and ProcessSize
     MPI_Comm_size(MPI_COMM_WORLD, &ProcessSize);
     MPI_Comm_rank(MPI_COMM_WORLD, &ThisRank);
 
 
-    // 假设 t_speed 结构体和 params 已经被定义和初始化
+    // Assume t_speed struct and params have been defined and initialized
 
-    // 让一个 t_speed 结构体在通信中被当作 9 连续 float 发送，方便 halo 交换、收敛等操作
+    // Make a t_speed struct be sent as 9 consecutive floats in communication, convenient for halo exchange, convergence, etc.
     MPI_Datatype MPI_T_SPEED;
     MPI_Type_contiguous(9, MPI_FLOAT, &MPI_T_SPEED);
     MPI_Type_commit(&MPI_T_SPEED);
 
 
-    // 打印一个进程提示信息
+    // Print process information
     printf("Process %d of %d started.\n", ThisRank, ProcessSize);
 
     char*    paramfile = NULL;    /* name of the input parameter file */
@@ -189,7 +189,7 @@ int main(int argc, char* argv[])
     tot_tic = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
     init_tic=tot_tic;
 
-    // 在这初始化，初始化给一个results数组，这个只有rank=0的时候才用，为了最后整合数据
+    // Initialize here, initialize a results array, only used when rank=0, for final data integration
     initialise(paramfile, obstaclefile, &params, &cells, &tmp_cells ,&results, &obstacles, &av_vels, ThisRank,ProcessSize,&KeepTotalRows
             ,&obstacles_Total, &numberOfNonObstacles);
 
@@ -207,7 +207,7 @@ int main(int argc, char* argv[])
     init_toc = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
     comp_tic=init_toc;
 
-    // 这个是每个进程需要处理的元素总数
+    // This is the total number of elements each process needs to handle
     int local_n_Size = (params.ny-2)*params.nx;
 
     for(int tt = 0; tt < params.maxIters; tt++)
@@ -215,34 +215,34 @@ int main(int argc, char* argv[])
         int up_neighbor = (ThisRank - 1 + ProcessSize) % ProcessSize;
         int down_neighbor = (ThisRank + 1) % ProcessSize;
 
-        // *** MOD ➋: 非阻塞通信 + 计算重叠
-        // req是返回的句柄，用于后续查询或等待这条非阻塞操作完成。
+        // *** MOD ②: Non-blocking communication + computation overlap
+        // req is the returned handle, used for subsequent querying or waiting for this non-blocking operation to complete.
         MPI_Request req[4];
 
-        // 10和11是tag 整型标签，用来区分不同消息。必须在收发两端匹配。
-        // (A) post non‑blocking halo exchange
-        // MPI_Isend第一个参数是发送缓冲区的起始地址（跳过第一行halo行）
-        MPI_Isend(cells+params.nx,              params.nx, MPI_T_SPEED, up_neighbor,   11, MPI_COMM_WORLD, &req[2]);             // 发送第一真实行
-        MPI_Isend(cells+(params.ny-2)*params.nx,params.nx, MPI_T_SPEED, down_neighbor, 10, MPI_COMM_WORLD, &req[3]);             // 发送最后真实行
+        // 10 and 11 are tags, integer labels used to distinguish different messages. Must match on both send and receive ends.
+        // (A) post non-blocking halo exchange
+        // MPI_Isend first parameter is the starting address of send buffer (skip first halo row)
+        MPI_Isend(cells+params.nx,              params.nx, MPI_T_SPEED, up_neighbor,   11, MPI_COMM_WORLD, &req[2]);             // Send first real row
+        MPI_Isend(cells+(params.ny-2)*params.nx,params.nx, MPI_T_SPEED, down_neighbor, 10, MPI_COMM_WORLD, &req[3]);             // Send last real row
 
-        // MPI_Irecv第一个参数是接收缓冲区的起始地址
-        MPI_Irecv(cells,                        params.nx, MPI_T_SPEED, up_neighbor,   10, MPI_COMM_WORLD, &req[0]);             // 上 halo
-        MPI_Irecv(cells+(params.ny-1)*params.nx,params.nx, MPI_T_SPEED, down_neighbor, 11, MPI_COMM_WORLD, &req[1]);             // 下 halo
+        // MPI_Irecv first parameter is the starting address of receive buffer
+        MPI_Irecv(cells,                        params.nx, MPI_T_SPEED, up_neighbor,   10, MPI_COMM_WORLD, &req[0]);             // Upper halo
+        MPI_Irecv(cells+(params.ny-1)*params.nx,params.nx, MPI_T_SPEED, down_neighbor, 11, MPI_COMM_WORLD, &req[1]);             // Lower halo
 
-        // (B) 先算内部行 (2 .. ny‑3)，可与网路传输并行
-        // 这个do_accel参数很重要，防止重复加速，对于最后一个进程，只需要在这里加速一次即可，在后续依赖halo的部分不需要加速
+        // (B) First compute internal rows (2 .. ny-3), can be done in parallel with network transmission
+        // This do_accel parameter is important to prevent duplicate acceleration; for the last process, only need to accelerate once here, no need to accelerate in subsequent halo-dependent parts
         float tot_u_in  = fusion_more(params, cells, tmp_cells, obstacles,
                                       w11, w22, c_sq, w0, w1, w2,
                                       divideVal, divideVal2,
                                       ThisRank, ProcessSize,
                 /*rowStart*/2, /*rowEnd*/params.ny-3, 1);
 
-        // (C) 等待 halo 完成
-        // MPI_Waitall(4, req, MPI_STATUSES_IGNORE); 的作用就是 阻塞当前线程，
-        // 直到 req[0]‥req[3] 所代表的 4个非阻塞通信全部完成。
+        // (C) Wait for halo completion
+        // MPI_Waitall(4, req, MPI_STATUSES_IGNORE); blocks the current thread
+        // until all 4 non-blocking communications represented by req[0]...req[3] are completed.
         MPI_Waitall(4, req, MPI_STATUSES_IGNORE);
 
-        // (D) 再算依赖 halo 的边界行 1 与 ny‑2
+        // (D) Then compute halo-dependent boundary rows 1 and ny-2
         float tot_u_bd  = fusion_more(params, cells, tmp_cells, obstacles,
                                       w11, w22, c_sq, w0, w1, w2,
                                       divideVal, divideVal2,
@@ -252,10 +252,10 @@ int main(int argc, char* argv[])
                                      divideVal, divideVal2,
                                      ThisRank, ProcessSize, params.ny-2, params.ny-2, 0);
 
-        // (E) 汇总本轮速度并交换指针
+        // (E) Sum up this round's velocity and swap pointers
         av_vels[tt] = tot_u_in + tot_u_bd;
 
-        // 每100个时间步输出一次动画数据
+        // Output animation data every 100 timesteps
 //        if (tt % 100 == 0) {
 //            write_animation_data_mpi(params, tmp_cells, tt, obstacles, ThisRank, ProcessSize,
 //                                     KeepTotalRows, obstacles_Total, MPI_T_SPEED);
@@ -273,33 +273,33 @@ int main(int argc, char* argv[])
 
     // Collate data from ranks here
 
-    //如果下面的结果如果和上面不一样，说明拷贝出了问题！
+    // If the results below are different from above, it means there's a problem with copying!
 
-    // 主进程在这回收数据, 回收的时候要注意，每个cells只有一部分是真正的数据，还有两行是halo
-    // 回收cells，并且放到results中
-    // obstacles我觉得不用回收，主进程保留一个大obstacles
+    // Main process collects data here, note that each cells only has a portion of real data, with two halo rows
+    // Collect cells and put them in results
+    // I think obstacles don't need to be collected, main process keeps a large obstacles
     // main process collect data here, and the operation is blocking operation
 
-    // 这一部分可以用MPI_Gatherv来实现，gatherv允许每个进程发送不同数量的数据，这样就不用计算每个进程需要发送的数据量了
+    // This part can be implemented with MPI_Gatherv, which allows each process to send different amounts of data, eliminating the need to calculate data volume for each process
     if (ThisRank==0) {
-        // 接收每个进程的cells数据
-        // 保存在results中
-        // 先把自己的数据拷贝到results中,results的大小就是正常大板子的大小！
+        // Receive cells data from each process
+        // Save in results
+        // First copy own data to results, results size is the normal large grid size!
         for (int i = 1; i < params.ny - 1; i++) {
             for (int j = 0; j < params.nx; j++) {
                 results[j + (i-1) * params.nx] = cells[j + i * params.nx];
             }
         }
-        int basic_work = (KeepTotalRows - 3) / ProcessSize; // 每个进程至少处理的行数
-        int remainder = (KeepTotalRows - 3) % ProcessSize; // 余数行
+        int basic_work = (KeepTotalRows - 3) / ProcessSize; // Minimum number of rows each process handles
+        int remainder = (KeepTotalRows - 3) % ProcessSize; // Remainder rows
 
-        // offsetStart初始化为主进程要处理的大小
+        // Initialize offsetStart to the size main process handles
         int offsetStart = local_n_Size;
 
-        // 一共112个进程
+        // Total 112 processes
         for (int i = 1; i < ProcessSize; i++) {
-            // 重新计算每个进程需要处理的行数以及元素总数
-            // 为每个进程计算行数
+            // Recalculate the number of rows and total elements each process needs to handle
+            // Calculate rows for each process
             int rows_per_process = basic_work + (i < remainder ? 1 : 0);
             if (i == ProcessSize - 1) {
                 rows_per_process += 3;
@@ -313,15 +313,15 @@ int main(int argc, char* argv[])
         MPI_Send(cells+params.nx, local_n_Size, MPI_T_SPEED, 0, 0, MPI_COMM_WORLD);
     }
 
-    //这里是为了计算每轮的平均值
+    // This is to calculate the average value for each round
     float total_av_vels[params.maxIters];
-    // 这行代码的作用是让所有进程把自己 av_vels 数组里的浮点值按元素位置做「求和」运算，
-    // 并把结果汇总到秩为0 的进程上的 total_av_vels 数组中。具体含义：
-    // total_avels：只有当进程秩（rank）为 0 时才写入规约结果，其他进程对此参数可忽略
+    // This line of code makes all processes perform "sum" operation on floating point values in their av_vels array by element position,
+    // and aggregates the results to the total_av_vels array on process with rank 0. Specific meaning:
+    // total_avels: Only writes reduction results when process rank is 0, other processes can ignore this parameter
     MPI_Reduce(av_vels, total_av_vels, params.maxIters, MPI_FLOAT, MPI_SUM, 0, MPI_COMM_WORLD);
 
     if (ThisRank == 0){
-        // 计算每轮的平均值
+        // Calculate average value for each round
         for (int tt = 0; tt < params.maxIters; tt++){
             av_vels[tt] = total_av_vels[tt] / (float)numberOfNonObstacles;
         }
@@ -332,9 +332,9 @@ int main(int argc, char* argv[])
     col_toc = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
     tot_toc = col_toc;
 //    /* write final values and free memory */
-// 在主进程写入数据，然后make check检查应该就是检查这里写的数据。
+// Write data in main process, then make check should verify the data written here.
     if (ThisRank == 0){
-        // 在写之前把正确的params->ny赋值回去
+        // Assign correct params->ny back before writing
         params.ny = KeepTotalRows;
         printf("==done==\n");
         printf("Reynolds number:\t\t%.12E\n", calc_reynolds(params, results, obstacles_Total));
@@ -357,8 +357,8 @@ float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells,const
     /* modify the 2nd row of the grid */
     // accelerate flow!!!!!
     // if this is the last process
-    // 这里只对最后一个进程进行加速操作
-    // 如果是最后一个进程，那么对倒数第二行进行加速操作
+    // Only perform acceleration operation for the last process
+    // If it's the last process, perform acceleration operation on the second-to-last row
     if (do_accel==1 && ThisRank == ProcessSize-1 ){
         const int LastSecondRow = params.ny - 3;
         // LastSecondRow = 3
@@ -367,7 +367,7 @@ float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells,const
             /* if the cell is not occupied and
             ** we don't send a negative density */
 
-            // 这里注意一下，障碍物索引
+            // Note the obstacle index here
             if (!obstacles[ii + (LastSecondRow-1)*params.nx]
                 && (cells[ii + LastSecondRow*params.nx].speeds[3] - w11) > 0.f
                 && (cells[ii + LastSecondRow*params.nx].speeds[6] - w22) > 0.f
@@ -385,7 +385,7 @@ float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells,const
         }
     }
 
-    //all above is accelerate_flow()!!!!!
+    // All above is accelerate_flow()!!!!!
     float tot_u;          /* accumulated magnitudes of velocity for each cell */
     /* initialise */
     tot_u = 0.f;
@@ -393,7 +393,7 @@ float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells,const
     /* loop over _all_ cells */
     // jj index from 1 to params.ny-2
     // ii index from 0 to params.nx-1
-    // 因为jj=0和最后一行是halo部分，是其他进程的halo数据，所以此进程要处理的数据从1开始到params.ny-2
+    // Because jj=0 and last row are halo parts from other processes, this process handles data from 1 to params.ny-2
     for (int jj = rowStart; jj <= rowEnd; jj++)
     {
         for (int ii = 0; ii < params.nx; ii++)
@@ -539,7 +539,7 @@ float fusion_more(const t_param params, t_speed* cells, t_speed* tmp_cells,const
                 /* called after propagate, so taking values from scratch space
                 ** mirroring, and writing into main grid */
 
-                // 注意如果是rebound，他的speeds[0]是不变的
+                // Note that if it's rebound, its speeds[0] remains unchanged
                 tmp_cells[ii + jj*params.nx].speeds[1] = keep[3];
                 tmp_cells[ii + jj*params.nx].speeds[2] = keep[4];
                 tmp_cells[ii + jj*params.nx].speeds[3] = keep[1];
@@ -680,52 +680,52 @@ int initialise(const char* paramfile, const char* obstaclefile,
     // here to keep the total rows
     *KeepTotalRows = params->ny;
 
-    //主进程也处理任务
+    // Main process also handles tasks
 
-    // 我需要在这里让最后一个进程，最少处理3行，这三行是最后三行！！！！！
-    // 这个原因不用管，是因为加速的逻辑，加速是只加速整个板子的倒数第二行，所以最后一个进程要处理最后三行防止数据冲突
+    // I need to ensure the last process handles at least 3 rows, which are the last three rows!!!!!
+    // This reason doesn't matter much, it's due to acceleration logic - acceleration only affects the second-to-last row of the entire grid, so the last process must handle the last three rows to prevent data conflicts
 
-//    目的：保证最后一个进程至少拥有网格倒数第 3、2、1 行，以便执行 accelerate_flow（只对 全局倒数第二行 加速）。
+//    Purpose: Ensure the last process has at least the last 3, 2, 1 rows of the grid to execute accelerate_flow (only accelerates the global second-to-last row).
 //
-//    局部网格尺寸：local_n = rows_per_process * nx
+//    Local grid size: local_n = rows_per_process * nx
 //
-//    真正参与计算的数据行：1 … rows_per_process，第 0 行和最后一行是 halo。
+//    Actual computation data rows: 1 … rows_per_process, row 0 and last row are halo.
 
-    int basic_work =  (params->ny-3) / ProcessSize; // 每个进程至少处理的行数
-    int remainder = (params->ny-3) % ProcessSize; // 余数行
-    // 假如size=8，余数最多是7行当rows=15时，不建议让最后一个线程处理8行，可以把这7行平均分给前7个线程
-    // 这样前面7个进程每个处理2行，最后一个进程处理1行
+    int basic_work =  (params->ny-3) / ProcessSize; // Minimum number of rows each process handles
+    int remainder = (params->ny-3) % ProcessSize; // Remainder rows
+    // If size=8, remainder is at most 7 rows when rows=15, it's not recommended to let the last thread handle 8 rows, can distribute these 7 rows evenly to the first 7 threads
+    // This way the first 7 processes each handle 2 rows, and the last process handles 1 row
 
-    // 为每个进程计算行数
+    // Calculate rows for each process
     int rows_per_process = basic_work + (ThisRank < remainder ? 1 : 0);
-    // 最后一个进程多处理3行
+    // Last process handles 3 additional rows
     if (ThisRank == ProcessSize-1){
         rows_per_process += 3;
     }
 
-    // 为每个进程分配本地数组大小,一个进程要处理的元素个数
-    // 最后一个进程的local_n可能会和其他进程不一样
+    // Allocate local array size for each process, number of elements a process needs to handle
+    // The last process's local_n may differ from other processes
     int local_n = rows_per_process * params->nx;
 
-    // 为每个进程分配本地数组大小，并且多分配两行用来存储halo数据，
+    // Allocate local array size for each process, and allocate two additional rows to store halo data
     *cells_ptr = (t_speed*)malloc(sizeof(t_speed) * (local_n + 2*params->nx));
 
-    // 同样为tmp_cells分配本地数组大小
-    // 这个不用初始化
+    // Similarly allocate local array size for tmp_cells
+    // This doesn't need initialization
     *tmp_cells_ptr = (t_speed*)malloc(sizeof(t_speed) * (local_n + 2*params->nx));
 
     if (*cells_ptr == NULL) die("cannot allocate memory for cells", __LINE__, __FILE__);
     if (*tmp_cells_ptr == NULL) die("cannot allocate memory for tmp_cells", __LINE__, __FILE__);
 
-    // 初始值都是一样的，无所谓。
+    // Initial values are all the same, doesn't matter.
     /* initialise densities */
     float w0 = params->density * 4.f / 9.f;
     float w1 = params->density      / 9.f;
     float w2 = params->density      / 36.f;
 
-    // 初始化这个进程的值，每个进程初始化的值一样，无所谓
-    // 注意，可以也初始化一下上下边界，初始化成一样的值，无所谓
-    // 因为不初始化，他halo exchange也会把这两行初始化
+    // Initialize values for this process, each process initializes the same values, doesn't matter
+    // Note, can also initialize upper and lower boundaries to the same values, doesn't matter
+    // Because if not initialized, halo exchange will also initialize these two rows
     for (int jj = 0; jj < rows_per_process+2; jj++)
     {
         for (int ii = 0; ii < params->nx; ii++)
@@ -749,7 +749,7 @@ int initialise(const char* paramfile, const char* obstaclefile,
     /* the map of obstacles */
     if (ThisRank == 0){
         // initialize results
-        // 这个是用来放所有进程的结果的，主进程用来收集所有进程的数据
+        // This is used to store results from all processes, main process uses it to collect data from all processes
         *results_ptr = (t_speed*)malloc(sizeof(t_speed) * (params->ny * params->nx));
 
         // malloc the entire obstacles array
@@ -792,7 +792,7 @@ int initialise(const char* paramfile, const char* obstaclefile,
         }
 
         *numberOfNonObstacles = 0;
-        // 一共有多少个物体 params->ny*params->nx  16384
+        // Total number of objects params->ny*params->nx  16384
         for (int jj = 0; jj < params->ny; jj++)
         {
             for (int ii = 0; ii < params->nx; ii++)
@@ -806,43 +806,43 @@ int initialise(const char* paramfile, const char* obstaclefile,
         /* and close the file */
         fclose(fp);
 
-        // 此时，主进程已经读取了障碍物，接下来广播（实际是发送）给其他进程，每个其他进程收到的obstacles对应各自的实际要处理的cells的大小
-        // 主进程也分配自己的obstacles
-        // 这个local_n是主进程自己的local_n
+        // At this point, main process has read obstacles, next broadcast (actually send) to other processes, each other process receives obstacles corresponding to their actual cells size to handle
+        // Main process also allocates its own obstacles
+        // This local_n is the main process's own local_n
         *obstacles_ptr = malloc(sizeof(int) * local_n);
         for (int i = 0; i < local_n; i++) {
             (*obstacles_ptr)[i] = (*obstacles_ptr_Total)[i];
         }
-        // 把其他obstacles发送给其他进程，每个进程的local_n不一样，因为这是在主进程中，所以要重新计算大小
+        // Send other obstacles to other processes, each process has different local_n, since this is in main process, need to recalculate size
         for (int i = 1; i < ProcessSize; i++) {
             int rows_for_this_process = basic_work + (i < remainder ? 1 : 0);
             if (i == ProcessSize-1){
                 rows_for_this_process += 3;
             }
 
-            // 为每个进程分配本地数组大小,一个进程要处理的元素个数
+            // Allocate local array size for each process, number of elements a process needs to handle
             int size_Process = rows_for_this_process * params->nx;
 
             int start_row = 0;
-            // 把之前每个进程处理的行数都加起来，得到这个进程开始的行数
+            // Add up the number of rows each previous process handled to get the starting row for this process
             for (int t = 0; t < i; t++) {
                 int rows_for_previous_process = basic_work + (t < remainder ? 1 : 0);
                 start_row += rows_for_previous_process;
             }
 
-            // 为每个进程分配本地数组大小，不用分配halo数据
-            // 这里分配一个临时变量，用来发送数据
-            // 其实这一部分可以省略，可以直接发送obstacles_ptr_Total，计算一下索引即可
+            // Allocate local array size for each process, no need to allocate halo data
+            // Allocate a temporary variable here to send data
+            // Actually this part can be omitted, can directly send obstacles_ptr_Total, just calculate the index
             int sendArr[size_Process];
             for (int j = 0; j < size_Process; j++) {
                 sendArr[j] = (*obstacles_ptr_Total)[j + (start_row * params->nx)];
             }
-            // 这里的size_Process是每个进程的local_n
+            // size_Process here is each process's local_n
             MPI_Send(sendArr, size_Process, MPI_INT, i, 0, MPI_COMM_WORLD);
         }
     }else{
-        // 这里是其他进程
-        // 其他进程接收主进程广播的obstacles
+        // This is other processes
+        // Other processes receive obstacles broadcast from main process
         *obstacles_ptr = malloc(sizeof(int) * local_n);
         // printf the size of local_n for this process
         MPI_Recv(*obstacles_ptr, local_n, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -851,10 +851,10 @@ int initialise(const char* paramfile, const char* obstaclefile,
     // here to make sure nx and ny are small fractions
 
     params->nx = params->nx;
-    // 真正要处理的数据是从第1行到rows_per_process+1行
+    // The real data to handle is from row 1 to rows_per_process+1
     // the real handle data is from the first row to the rows_per_process+1 row
 
-    // 在这确保params的ny是片段的大小，方便后续计算
+    // Ensure params->ny is the fragment size here for easier subsequent calculations
     params->ny = rows_per_process+2;
 
     /*
@@ -1019,7 +1019,7 @@ void write_animation_data_mpi(const t_param params, t_speed* cells, const int ti
                               int KeepTotalRows, const int* obstacles_Total,
                               MPI_Datatype MPI_T_SPEED) {
 
-    // 创建临时结果数组用于收集所有进程的数据
+    // Create temporary result array to collect data from all processes
     t_speed* temp_results = NULL;
 
     if (ThisRank == 0) {
@@ -1029,27 +1029,27 @@ void write_animation_data_mpi(const t_param params, t_speed* cells, const int ti
         }
     }
 
-    // 计算数据收集的参数，与程序结束时的逻辑相同
+    // Calculate data collection parameters, same logic as at program end
     int basic_work = (KeepTotalRows - 3) / ProcessSize;
     int remainder = (KeepTotalRows - 3) % ProcessSize;
 
-    // 计算当前进程的数据大小（不包括halo）
+    // Calculate current process data size (excluding halo)
     int rows_per_process = basic_work + (ThisRank < remainder ? 1 : 0);
     if (ThisRank == ProcessSize - 1) {
         rows_per_process += 3;
     }
     int local_data_size = rows_per_process * params.nx;
 
-    // 数据收集
+    // Data collection
     if (ThisRank == 0) {
-        // 主进程：先复制自己的数据（跳过halo行）
+        // Main process: first copy own data (skip halo rows)
         for (int i = 1; i < params.ny - 1; i++) {
             for (int j = 0; j < params.nx; j++) {
                 temp_results[j + (i-1) * params.nx] = cells[j + i * params.nx];
             }
         }
 
-        // 接收其他进程的数据
+        // Receive data from other processes
         int offsetStart = local_data_size;
         for (int i = 1; i < ProcessSize; i++) {
             int other_rows = basic_work + (i < remainder ? 1 : 0);
@@ -1063,7 +1063,7 @@ void write_animation_data_mpi(const t_param params, t_speed* cells, const int ti
             offsetStart += other_size;
         }
 
-        // 现在主进程有完整数据，开始写入动画文件
+        // Now main process has complete data, start writing animation file
         char filename[256];
         sprintf(filename, "animation_data/velocity_magnitude_%06d.dat", timestep);
 
@@ -1072,15 +1072,15 @@ void write_animation_data_mpi(const t_param params, t_speed* cells, const int ti
             die("could not open animation data file", __LINE__, __FILE__);
         }
 
-        // 写入网格尺寸信息
+        // Write grid dimension information
         fprintf(fp, "# nx=%d ny=%d timestep=%d\n", params.nx, KeepTotalRows, timestep);
 
-        // 为每个格点计算并写入velocity magnitude
+        // Calculate and write velocity magnitude for each grid point
         for (int jj = 0; jj < KeepTotalRows; jj++) {
             for (int ii = 0; ii < params.nx; ii++) {
                 float velocity_magnitude = 0.0f;
 
-                // 如果不是障碍物，计算velocity magnitude
+                // If not an obstacle, calculate velocity magnitude
                 if (!obstacles_Total[ii + jj * params.nx]) {
                     float local_density = 0.f;
                     for (int kk = 0; kk < NSPEEDS; kk++) {
@@ -1113,11 +1113,11 @@ void write_animation_data_mpi(const t_param params, t_speed* cells, const int ti
         fclose(fp);
         printf("Written animation data for timestep %d\n", timestep);
 
-        // 释放临时内存
+        // Free temporary memory
         free(temp_results);
 
     } else {
-        // 其他进程：发送自己的数据（跳过halo行）
+        // Other processes: send own data (skip halo rows)
         MPI_Send(cells + params.nx, local_data_size, MPI_T_SPEED, 0, 100 + timestep, MPI_COMM_WORLD);
     }
 }

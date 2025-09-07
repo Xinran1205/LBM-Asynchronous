@@ -58,15 +58,15 @@
 #include <omp.h>
 
 
-/* === Intel‑only intrinsics → GCC 兼容 shim === */
+/* === Intel-only intrinsics → GCC compatibility shim === */
 #if defined(__GNUC__)
 #  include <stdlib.h>
 #  include <stddef.h>
-/* __assume(cond) —— GCC 下无等价，直接空吞 */
+/* __assume(cond) —— No equivalent in GCC, just ignore */
 #  ifndef __assume
 #    define __assume(x) ((void)0)
 #  endif
-/* __assume_aligned(p, a) —— 如果要利用对齐提示可以启用下一行，否则也空吞：
+/* __assume_aligned(p, a) —— Enable next line to use alignment hints, otherwise ignore:
 #  ifndef __assume_aligned
 #    define __assume_aligned(p, a) p = __builtin_assume_aligned(p, a)
 #  endif
@@ -218,7 +218,7 @@ int main(int argc, char* argv[])
         av_vels[tt] = fusion_more(params, cells_soa_ptr, tmp_cells_soa_ptr, obstacles,
                                   w11, w22, c_sq, w0, w1, w2,divideVal,divideVal2);
 
-        // 每100个时间步输出一次动画数据
+        // Output animation data every 100 timesteps
 //        if (tt % 100 == 0) {
 //            write_animation_data(params, cells_soa_ptr, tt, obstacles);
 //        }
@@ -242,7 +242,7 @@ int main(int argc, char* argv[])
     tot_toc = col_toc;
 
 
-    // 打印值 主要是为了check结果是否正确
+    // Print values mainly to check if results are correct
     /* write final values and free memory */
     printf("==done==\n");
     printf("Reynolds number:\t\t%.12E\n", calc_reynolds(params, &cells_soa, obstacles));
@@ -300,7 +300,7 @@ float fusion_more(const t_param params, t_speeds_soa* restrict cells_soa, t_spee
 //    __assume(params.nx % 64 == 0);
 //    __assume(params.nx % 128 == 0);
 
-    // 给倒数第二行的每个cell加上w11和w22
+    // Add w11 and w22 to each cell in the second-to-last row
 #pragma omp simd
     for (int ii = 0; ii < params.nx; ii++) {
         /* if the cell is not occupied and
@@ -320,7 +320,7 @@ float fusion_more(const t_param params, t_speeds_soa* restrict cells_soa, t_spee
         }
     }
 
-    //all above is accelerate_flow()!!!!!
+    // All above is accelerate_flow()!!!!!
     /* loop over _all_ cells */
 
 //    __assume(params.ny % 2 == 0);
@@ -497,7 +497,7 @@ float fusion_more(const t_param params, t_speeds_soa* restrict cells_soa, t_spee
     return tot_u / (float)tot_cells;
 }
 
-// 这个函数主要是用在计算雷诺平均里面的，是为了check最后结果的，不是很重要
+// This function is mainly used in Reynolds number calculation, to check final results, not very important
 float av_velocity(const t_param params, t_speeds_soa* cells_soa, const int* obstacles)
 {
 //    __assume_aligned(cells_soa, 64);
@@ -797,7 +797,7 @@ int finalise(const t_param* params, t_speeds_soa* cells_soa, t_speeds_soa* tmp_c
     return EXIT_SUCCESS;
 }
 
-// 计算雷诺平均，不重要，主要是为了比较结果是否正确
+// Calculate Reynolds number, not important, mainly to compare if results are correct
 float calc_reynolds(const t_param params, t_speeds_soa* cells_soa, int* obstacles)
 {
     const float viscosity = 1.f / 6.f * (2.f / params.omega - 1.f);
@@ -939,15 +939,15 @@ void write_animation_data(const t_param params, t_speeds_soa* cells_soa, const i
         die("could not open animation data file", __LINE__, __FILE__);
     }
 
-    // 写入网格尺寸信息
+    // Write grid dimension information
     fprintf(fp, "# nx=%d ny=%d timestep=%d\n", params.nx, params.ny, timestep);
     
-    // 为每个格点计算并写入velocity magnitude
+    // Calculate and write velocity magnitude for each grid point
     for (int jj = 0; jj < params.ny; jj++) {
         for (int ii = 0; ii < params.nx; ii++) {
             float velocity_magnitude = 0.0f;
             
-            // 如果不是障碍物，计算velocity magnitude
+            // If not an obstacle, calculate velocity magnitude
             if (!obstacles[ii + jj * params.nx]) {
                 float local_density = cells_soa->speeds0[ii + jj * params.nx]
                                     + cells_soa->speeds1[ii + jj * params.nx]
